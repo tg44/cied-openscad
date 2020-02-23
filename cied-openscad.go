@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -14,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/streadway/amqp"
@@ -106,13 +108,17 @@ func receive(ch amqp.Channel, queue amqp.Queue, doneQueue amqp.Queue, s *session
 
 	go func() {
 		for d := range msgs {
-			jobid, outpath, runtime, err := processJob(d.Body, s, bucket)
+			jobid, command, stdout, stderr, outpath, runtime, err := processJob(d.Body, s, bucket)
 			if jobid == "" {
 				log.Printf("There was a json parse error! %s", d.Body)
 			} else {
-				doneMsg := FinishedJobMessage{jobid, outpath, err, runtime}
+				doneMsg := FinishedJobMessage{jobid, outpath, err, runtime, stdout, stderr, command}
 				send(ch, doneQueue, doneMsg)
-				log.Printf("%s finished in %d ms", jobid, runtime)
+				if err != nil {
+					log.Printf("%s failed in %d ms with %s", jobid, runtime, err.Error())
+				} else {
+					log.Printf("%s finished in %d ms", jobid, runtime)
+				}
 			}
 			d.Ack(false)
 		}
@@ -139,36 +145,37 @@ func send(ch amqp.Channel, queue amqp.Queue, msg FinishedJobMessage) {
 	}
 }
 
-func processJob(js []byte, s *session.Session, s3Bucket string) (string, string, int64, error) {
+//jobid, command, stdout, stderr, fileurl, time, error
+func processJob(js []byte, s *session.Session, s3Bucket string) (string, string, string, string, string, int64, error) {
 	start := time.Now()
 
 	var parsedMsg JobMessage
 	err := json.Unmarshal(js, &parsedMsg)
 	if err != nil {
-		return "", "", time.Since(start).Milliseconds(), err
+		return "", "", "", "", "", time.Since(start).Milliseconds(), err
 	}
 	log.Printf("%s starting job", parsedMsg.JobID)
 	dir, err := ioutil.TempDir("", "job")
 	if err != nil {
-		return parsedMsg.JobID, "", time.Since(start).Milliseconds(), err
+		return parsedMsg.JobID, "", "", "", "", time.Since(start).Milliseconds(), err
 	}
 	defer os.RemoveAll(dir)
-	err = downloadFiles(dir, parsedMsg.File, parsedMsg.Files)
+	err = downloadFiles(dir, parsedMsg.MainFile, parsedMsg.ResourceFiles)
 	if err != nil {
-		return parsedMsg.JobID, "", time.Since(start).Milliseconds(), err
+		return parsedMsg.JobID, "", "", "", "", time.Since(start).Milliseconds(), err
 	}
 	log.Printf("%s download completed", parsedMsg.JobID)
-	err = runOScad(parsedMsg, dir)
+	command, stdOut, stdErr, err := runOScad(parsedMsg, dir)
 	if err != nil {
-		return parsedMsg.JobID, "", time.Since(start).Milliseconds(), err
+		return parsedMsg.JobID, command, stdOut, stdErr, "", time.Since(start).Milliseconds(), err
 	}
 	log.Printf("%s render completed", parsedMsg.JobID)
 	url, err := uploadFileToS3(s, s3Bucket, filepath.Join(dir, "model.stl"), filepath.Join(parsedMsg.JobID, "model.stl"))
 	if err != nil {
-		return parsedMsg.JobID, "", time.Since(start).Milliseconds(), err
+		return parsedMsg.JobID, command, stdOut, stdErr, "", time.Since(start).Milliseconds(), err
 	}
 
-	return parsedMsg.JobID, url, time.Since(start).Milliseconds(), nil
+	return parsedMsg.JobID, command, stdOut, stdErr, url, time.Since(start).Milliseconds(), nil
 }
 
 func downloadFiles(dir string, file string, files []string) error {
@@ -205,7 +212,7 @@ func downloadOneFile(dir string, url string) error {
 	return err
 }
 
-func runOScad(jm JobMessage, dir string) error {
+func runOScad(jm JobMessage, dir string) (string, string, string, error) {
 	cmd := exec.Command("openscad")
 	cmd.Dir = dir
 	cmd.Args = append(cmd.Args, "-o", "model.stl")
@@ -214,13 +221,20 @@ func runOScad(jm JobMessage, dir string) error {
 	for key, value := range params {
 		cmd.Args = append(cmd.Args, "-D", fmt.Sprintf("'%s=%s'", key, value))
 	}
-	cmd.Args = append(cmd.Args, path.Base(jm.File))
+	cmd.Args = append(cmd.Args, path.Base(jm.MainFile))
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	var out2 bytes.Buffer
+	cmd.Stderr = &out2
 
 	err := cmd.Run()
+
 	if err != nil {
-		return err
+		return strings.Join(cmd.Args," "), out.String(), out2.String(), err
 	}
-	return nil
+	return strings.Join(cmd.Args," "), out.String(), out2.String(), nil
 }
 
 func uploadFileToS3(s *session.Session, s3Bucket string, fileDir string, outFileName string) (string, error) {
@@ -262,12 +276,15 @@ type FinishedJobMessage struct {
 	File string     `json:"file"`
 	Error error `json:"error"`
 	Runtime int64 `json:"runTime"`
+	StdOut string `json:"stdOut"`
+	StdErr string `json:"stdErr"`
+	CommandInfo string `json:"commandInfo"`
 }
 
 type JobMessage struct {
 	JobID  string   `json:"jobId"`
-	File string     `json:"file"`
-	Files  []string `json:"files"`
+	MainFile string     `json:"mainFile"`
+	ResourceFiles  []string `json:"resourceFiles"`
 	ParamsRaw map[string]interface{} `json:"params"`
 }
 
